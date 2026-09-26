@@ -30,6 +30,36 @@ class Passenger(BaseModel):
     alight: NonNegativeInt = Field(description="station index where the passenger alights")
 
 
+def _validate_roster(n: int, passengers) -> None:
+    """Reject duplicate ids and invalid boarding intervals for a trip."""
+    seen = set()
+    for p in passengers:
+        key = str(p.id)
+        if key in seen:
+            raise ValueError(f"duplicate passenger id: {p.id!r}")
+        seen.add(key)
+        if p.board >= p.alight:
+            raise ValueError(
+                f"passenger {p.id!r}: invalid interval board={p.board}, "
+                f"alight={p.alight} (board must be < alight)"
+            )
+        if p.alight > n:
+            raise ValueError(
+                f"passenger {p.id!r}: alight station {p.alight} is out of range; "
+                f"a trip with {n} segment(s) has stations 0..{n}"
+            )
+
+
+def _validate_charged_segments(segment_costs: List[int], passengers) -> None:
+    """Reject positive-cost segments that carry no passengers."""
+    for i, cost in enumerate(segment_costs):
+        if cost > 0 and not any(p.board <= i < p.alight for p in passengers):
+            raise ValueError(
+                f"segment {i} has cost {cost} but no passengers on board "
+                f"(empty-load charged segment)"
+            )
+
+
 class SplitRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -42,30 +72,8 @@ class SplitRequest(BaseModel):
     @model_validator(mode="after")
     def _check_trip(self) -> "SplitRequest":
         n = len(self.segments)
-
-        seen = set()
-        for p in self.passengers:
-            key = str(p.id)
-            if key in seen:
-                raise ValueError(f"duplicate passenger id: {p.id!r}")
-            seen.add(key)
-            if p.board >= p.alight:
-                raise ValueError(
-                    f"passenger {p.id!r}: invalid interval board={p.board}, "
-                    f"alight={p.alight} (board must be < alight)"
-                )
-            if p.alight > n:
-                raise ValueError(
-                    f"passenger {p.id!r}: alight station {p.alight} is out of range; "
-                    f"a trip with {n} segment(s) has stations 0..{n}"
-                )
-
-        for i, cost in enumerate(self.segments):
-            if cost > 0 and not any(p.board <= i < p.alight for p in self.passengers):
-                raise ValueError(
-                    f"segment {i} has cost {cost} but no passengers on board "
-                    f"(empty-load charged segment)"
-                )
+        _validate_roster(n, self.passengers)
+        _validate_charged_segments(self.segments, self.passengers)
         return self
 
 
@@ -165,4 +173,88 @@ class SettleResponse(BaseModel):
     transfers: List[Transfer] = Field(
         description="minimum set of payments that settles every balance, "
                     "ordered by (from, to, amount) in canonical passenger-id order"
+    )
+
+
+class Candidate(Passenger):
+    """A passenger applying to be admitted, with a willingness-to-pay cap."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_fare: NonNegativeInt = Field(
+        description="most the candidate is willing to pay in integer cents; "
+                    "they are admitted only if their recomputed share does not exceed it"
+    )
+
+
+class AdmitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    segments: List[NonNegativeInt] = Field(
+        min_length=1,
+        description="integer cost of each segment in cents, in travel order",
+    )
+    passengers: List[Passenger] = Field(
+        default_factory=list,
+        description="passengers already on the trip",
+    )
+    capacity: PositiveInt = Field(
+        description="uniform per-segment seat cap; the number of passengers "
+                    "(existing plus newly admitted) on every segment must not exceed it",
+    )
+    candidates: List[Candidate] = Field(
+        max_length=12,
+        description="up to 12 candidate passengers (id/board/alight/max_fare) "
+                    "considered for admission",
+    )
+
+    @model_validator(mode="after")
+    def _check_admit(self) -> "AdmitRequest":
+        n = len(self.segments)
+        _validate_roster(n, self.passengers)
+
+        seen = {str(p.id) for p in self.passengers}
+        for c in self.candidates:
+            key = str(c.id)
+            if key in seen:
+                raise ValueError(f"duplicate passenger id: {c.id!r}")
+            seen.add(key)
+            if c.board >= c.alight:
+                raise ValueError(
+                    f"candidate {c.id!r}: invalid interval board={c.board}, "
+                    f"alight={c.alight} (board must be < alight)"
+                )
+            if c.alight > n:
+                raise ValueError(
+                    f"candidate {c.id!r}: alight station {c.alight} is out of range; "
+                    f"a trip with {n} segment(s) has stations 0..{n}"
+                )
+
+        for i, cost in enumerate(self.segments):
+            load = sum(p.board <= i < p.alight for p in self.passengers)
+            if load > self.capacity:
+                raise ValueError(
+                    f"segment {i} already carries {load} existing passenger(s), "
+                    f"exceeding capacity {self.capacity}"
+                )
+            if cost > 0 and load == 0:
+                raise ValueError(
+                    f"segment {i} has cost {cost} but no passengers on board "
+                    f"(empty-load charged segment)"
+                )
+        return self
+
+
+class AdmitResponse(BaseModel):
+    admitted: List[PassengerId] = Field(
+        description="ids of the admitted candidates in canonical id order "
+                    "(integer ids numerically, then string ids lexicographically); "
+                    "empty when no candidate can be admitted"
+    )
+    totals: Dict[str, NonNegativeInt] = Field(
+        description="cents charged to every passenger (existing plus admitted); "
+                    "sums to total_cost",
+    )
+    segments: List[SegmentSplit] = Field(
+        description="per-segment split detail of the resulting trip"
     )

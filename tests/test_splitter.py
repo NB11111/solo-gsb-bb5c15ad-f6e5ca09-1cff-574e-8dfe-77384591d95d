@@ -8,11 +8,15 @@ import random
 import unittest
 from types import SimpleNamespace as P
 
-from app.splitter import _triple, settle_balances, split_fares
+from app.splitter import _triple, admit_passengers, settle_balances, split_fares
 
 
 def ride(pid, board, alight):
     return P(id=pid, board=board, alight=alight)
+
+
+def cand(pid, board, alight, max_fare):
+    return P(id=pid, board=board, alight=alight, max_fare=max_fare)
 
 
 class SplitFaresTests(unittest.TestCase):
@@ -98,6 +102,132 @@ class PropertyTests(unittest.TestCase):
             totals2, details2 = split_fares(segments, shuffled)
             self.assertEqual(totals, totals2)
             self.assertEqual(details, details2)
+
+
+class AdmitPassengersTests(unittest.TestCase):
+    def test_admit_all_when_everyone_fits(self):
+        existing = [ride("a", 0, 2)]
+        candidates = [cand("b", 0, 2, 100), cand("c", 0, 1, 100)]
+        admitted, totals, _ = admit_passengers([100, 100], existing, candidates, 3)
+        # seg0: a,b,c -> 34/33/33 (a wins tie); seg1: a,b -> 50/50
+        self.assertEqual(admitted, ["b", "c"])
+        self.assertEqual(totals, {"a": 84, "b": 83, "c": 33})
+
+    def test_maximize_count_first(self):
+        # cap 2 with one whole-trip rider: two short riders can be admitted
+        # together on different segments, which beats one whole-trip rider.
+        existing = [ride("a", 0, 3)]
+        candidates = [
+            cand("long", 0, 3, 1000),
+            cand("x", 0, 1, 1000),
+            cand("y", 2, 3, 1000),
+        ]
+        admitted, totals, _ = admit_passengers([100, 100, 100], existing, candidates, 2)
+        self.assertEqual(admitted, ["x", "y"])
+        self.assertEqual(totals, {"a": 200, "x": 50, "y": 50})
+
+    def test_then_minimize_admitted_fare_sum(self):
+        # cap 2: "rich" rides the whole trip for 150, "cheap" only one
+        # segment for 50; both are solo options of the same max count.
+        existing = [ride("a", 0, 3)]
+        candidates = [
+            cand("rich", 0, 3, 1000),
+            cand("cheap", 0, 1, 1000),
+        ]
+        admitted, totals, _ = admit_passengers([100, 100, 100], existing, candidates, 2)
+        self.assertEqual(admitted, ["cheap"])
+        self.assertEqual(totals, {"a": 250, "cheap": 50})
+
+    def test_max_fare_binds_after_full_roster_re_split(self):
+        # Two candidates split 100 evenly (50 each); "fussy" caps at 49 and
+        # must be rejected. Alone the winner pays the whole 100, which is
+        # beyond both caps, so nobody is admitted and the empty (original)
+        # trip is returned.
+        existing = []
+        candidates = [cand("ok", 0, 1, 50), cand("fussy", 0, 1, 49)]
+        admitted, totals, _ = admit_passengers([100], existing, candidates, 4)
+        self.assertEqual(admitted, [])
+        self.assertEqual(totals, {})
+
+    def test_max_fare_is_checked_on_recomputed_share(self):
+        # With two segments each rider alone pays 120; both ride and each
+        # pays 60, so a cap of 60 admits both — the cap is evaluated on the
+        # recomputed full-roster share, not the pre-admission fare (0).
+        existing = []
+        candidates = [cand("a", 0, 2, 60), cand("b", 0, 2, 60)]
+        admitted, totals, _ = admit_passengers([60, 60], existing, candidates, 4)
+        self.assertEqual(admitted, ["a", "b"])
+        self.assertEqual(totals, {"a": 60, "b": 60})
+        # Tighten one cap below 60: alone the survivor pays 120 > 59 too,
+        # so no newcomer works at all.
+        candidates[1] = cand("b", 0, 2, 59)
+        admitted, totals, _ = admit_passengers([60, 60], existing, candidates, 4)
+        self.assertEqual(admitted, [])
+
+    def test_no_feasible_newcomer_returns_original_split(self):
+        existing = [ride("a", 0, 1)]
+        admitted, totals, details = admit_passengers(
+            [100], existing, [cand("b", 0, 1, 49)], 2
+        )
+        self.assertEqual(admitted, [])
+        base_totals, base_details = split_fares([100], existing)
+        self.assertEqual(totals, base_totals)
+        self.assertEqual(details, base_details)
+
+    def test_empty_candidates(self):
+        existing = [ride("a", 0, 1)]
+        admitted, totals, details = admit_passengers([100], existing, [], 2)
+        self.assertEqual(admitted, [])
+        self.assertEqual(totals, {"a": 100})
+        self.assertEqual(details[0]["shares"], {"a": 100})
+
+    def test_tie_break_canonical_id_order_ints_before_strings(self):
+        # cap allows exactly 2 of 3; every pair pays the same, so the
+        # canonical-smallest pair {1, 2} wins over {2, "x"} and {1, "x"}.
+        existing = [ride("z", 0, 1)]
+        candidates = [
+            cand("x", 0, 1, 100),
+            cand(1, 0, 1, 100),
+            cand(2, 0, 1, 100),
+        ]
+        admitted, _, _ = admit_passengers([90], existing, candidates, 3)
+        self.assertEqual(admitted, [1, 2])
+
+    def test_tie_break_integers_compare_numerically(self):
+        # 9 sorts before 10 numerically (not lexicographically).
+        existing = [ride("z", 0, 1)]
+        candidates = [cand(10, 0, 1, 100), cand(9, 0, 1, 100)]
+        admitted, _, _ = admit_passengers([90], existing, candidates, 3)
+        self.assertEqual(admitted, [9, 10])
+
+    def test_input_order_does_not_matter(self):
+        import random
+        existing = [ride("a", 0, 3), ride("b", 1, 3)]
+        candidates = [
+            cand("c1", 0, 2, 200), cand(2, 1, 3, 80),
+            cand("c2", 0, 1, 80), cand(5, 2, 3, 40),
+        ]
+        segments = [100, 251, 80]
+        baseline = admit_passengers(segments, existing, candidates, 4)
+        for seed in range(8):
+            rng = random.Random(seed)
+            ex = existing[:]; cs = candidates[:]
+            rng.shuffle(ex); rng.shuffle(cs)
+            self.assertEqual(
+                admit_passengers(segments, ex, cs, 4), baseline
+            )
+
+    def test_details_match_split_fares_for_chosen_roster(self):
+        existing = [ride("a", 0, 3)]
+        candidates = [cand("b", 0, 2, 500), cand("c", 1, 3, 500)]
+        admitted, totals, details = admit_passengers(
+            [100, 251, 80], existing, candidates, 3
+        )
+        chosen = [p for p in existing + candidates
+                  if p.id in set(admitted) or p.id == "a"]
+        ref_totals, ref_details = split_fares([100, 251, 80], chosen)
+        self.assertEqual(totals, ref_totals)
+        self.assertEqual(details, ref_details)
 
 
 class SettleBalancesTests(unittest.TestCase):

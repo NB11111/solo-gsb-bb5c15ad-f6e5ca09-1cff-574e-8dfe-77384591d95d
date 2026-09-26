@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from fractions import Fraction
 from functools import lru_cache
+from itertools import combinations
+from math import gcd as _gcd
 from typing import Dict, List, Tuple
 
 
@@ -82,6 +84,188 @@ def split_fares(segment_costs: List[int], passengers) -> Tuple[Dict, List[dict]]
 
     totals = {pid: allocated[pid] for pid in sorted(allocated, key=tie_key)}
     return totals, details
+
+
+# --- admission: pick the best feasible subset of candidate passengers
+
+
+def admit_passengers(segment_costs: List[int], passengers, candidates,
+                     capacity: int) -> Tuple[List, Dict, List[dict]]:
+    """Choose which candidate passengers to admit onto an existing trip.
+
+    ``passengers`` are already on the trip; ``candidates`` (at most 12)
+    additionally expose a ``max_fare`` attribute — the most they are willing
+    to pay, in cents. A subset of candidates is *feasible* when, with those
+    candidates riding alongside the existing passengers:
+
+    * every segment carries at most ``capacity`` passengers, and
+    * each admitted candidate's share — recomputed by :func:`split_fares`
+      over the *full* resulting roster — does not exceed their ``max_fare``.
+
+    Feasible subsets are ranked by, in order: most admitted candidates,
+    then least total cents owed by the admitted candidates, then the
+    lexicographically smallest candidate-id list in :func:`tie_key` order.
+    The empty subset is always feasible, so when no candidate can be
+    admitted the result is simply the original trip's split.
+
+    Returns ``(admitted_ids, totals, details)`` where ``admitted_ids`` is
+    the winning candidate-id list in canonical :func:`tie_key` order and
+    ``totals``/``details`` are the :func:`split_fares` result for the full
+    roster (existing passengers plus the admitted candidates).
+    """
+    n_segments = len(segment_costs)
+
+    # Existing roster, pre-sorted in canonical order per segment.
+    existing = sorted(passengers, key=lambda p: tie_key(p.id))
+    existing_by_seg = [
+        [p for p in existing if p.board <= i < p.alight]
+        for i in range(n_segments)
+    ]
+
+    ordered = sorted(candidates, key=lambda c: tie_key(c.id))
+    n = len(ordered)
+    candidate_key = [tie_key(c.id) for c in ordered]
+    id_key = {c.id: candidate_key[j] for j, c in enumerate(ordered)}
+    id_key.update({p.id: tie_key(p.id) for p in existing})
+    max_fare = [c.max_fare for c in ordered]
+    # Per candidate, a bitmask of the segments they occupy.
+    cand_mask = [
+        sum(1 << i for i in range(c.board, c.alight)) for c in ordered
+    ]
+    # Per segment, candidates (canonical index) present on it.
+    cands_by_seg = [
+        [j for j in range(n) if cand_mask[j] & (1 << i)]
+        for i in range(n_segments)
+    ]
+    # Capacity slack per segment after the existing passengers.
+    slack = [capacity - len(existing_by_seg[i]) for i in range(n_segments)]
+
+    # Deficits are exact fractions with denominator <= number of onboard
+    # passengers; scaling by lcm(1..max_onboard) makes every deficit an
+    # integer, so the whole search is Fraction-free. Onboard count never
+    # exceeds existing passengers plus the (at most 12) candidates.
+    max_onboard = min(capacity, len(passengers) + n)
+    scale = 1
+    for k in range(2, max_onboard + 1):
+        scale = scale * k // _gcd(scale, k)
+
+    def evaluate(mask: int, want_details: bool):
+        """Run the same allocation as split_fares for the roster in ``mask``.
+
+        Returns ``(totals, details)`` exactly as :func:`split_fares` would
+        for the full roster, or ``None`` as soon as some selected candidate
+        can no longer finish within their ``max_fare``. Deficits are kept
+        scaled by ``scale`` rather than as :class:`Fraction` values.
+        """
+        deficits = {p.id: 0 for p in existing}
+        deficits.update(
+            (ordered[j].id, 0) for j in range(n) if mask & (1 << j)
+        )
+        allocated = {pid: 0 for pid in deficits}
+        chosen_set = mask
+        details: List[dict] = []
+
+        for i, cost in enumerate(segment_costs):
+            present = [j for j in cands_by_seg[i] if chosen_set & (1 << j)]
+            if not present:
+                onboard_ids = [p.id for p in existing_by_seg[i]]
+            else:
+                # Merge two canonical-id-sorted lists.
+                chosen_ids = [ordered[j].id for j in present]
+                merged, a, b = [], 0, 0
+                old = [p.id for p in existing_by_seg[i]]
+                while a < len(old) and b < len(chosen_ids):
+                    if id_key[old[a]] <= candidate_key[present[b]]:
+                        merged.append(old[a]); a += 1
+                    else:
+                        merged.append(chosen_ids[b]); b += 1
+                merged.extend(old[a:]); merged.extend(chosen_ids[b:])
+                onboard_ids = merged
+
+            if not onboard_ids:
+                if want_details:
+                    details.append({"index": i, "cost": cost,
+                                    "passengers": [], "shares": {}})
+                continue
+
+            m = len(onboard_ids)
+            base, rem = divmod(cost, m)
+            add = scale * rem // m
+            # Largest deficit (including this segment's add) wins the
+            # leftover cents; ties are broken by canonical id order.
+            ranked = sorted(
+                onboard_ids,
+                key=lambda pid: (-(deficits[pid] + add), id_key[pid]),
+            )
+            extra = set(ranked[:rem])
+            shares = {}
+            for pid in onboard_ids:
+                amount = base + (1 if pid in extra else 0)
+                shares[pid] = amount
+                allocated[pid] += amount
+                # Scaled deficit accumulates rem/m; recipients of a leftover
+                # cent are charged 1 (== scale/scale). The shared base term
+                # never affects rankings and is omitted.
+                deficits[pid] += add
+                if pid in extra:
+                    deficits[pid] -= scale
+            if not want_details:
+                # Selected candidates already above their cap can never
+                # recover (future allocations are non-negative).
+                for j in present:
+                    if allocated[ordered[j].id] > max_fare[j]:
+                        return None
+            if want_details:
+                details.append({"index": i, "cost": cost,
+                                "passengers": onboard_ids, "shares": shares})
+
+        if not want_details:
+            for j in range(n):
+                if chosen_set & (1 << j) and allocated[ordered[j].id] > max_fare[j]:
+                    return None
+        totals = {pid: allocated[pid] for pid in sorted(allocated, key=id_key.__getitem__)}
+        return totals, details if want_details else None
+
+    best = None  # ((fare_sum, canonical id tuple), mask, totals)
+
+    # Largest subsets first; capacity feasibility is downward closed, so
+    # stop splitting as soon as one size yields a fare-feasible roster.
+    for size in range(n, -1, -1):
+        for combo in combinations(range(n), size):
+            mask = 0
+            for j in combo:
+                mask |= 1 << j
+            # Union of the chosen candidates' occupied segments.
+            over = False
+            for i in range(n_segments):
+                extra = 0
+                for j in combo:
+                    if cand_mask[j] & (1 << i):
+                        extra += 1
+                if extra > slack[i]:
+                    over = True
+                    break
+            if over:
+                continue
+
+            result = evaluate(mask, want_details=False)
+            if result is None:
+                continue
+            totals, _ = result
+            fare_sum = sum(totals[ordered[j].id] for j in combo)
+            rank = (fare_sum, tuple(candidate_key[j] for j in combo))
+            if best is None or rank < best[0]:
+                best = (rank, mask, totals)
+        if best is not None:
+            break
+
+    _, mask, totals = best
+    if mask == 0:
+        # Preserve split_fares output for the no-newcomer fallback.
+        totals, details = split_fares(segment_costs, list(passengers))
+    else:
+        _, details = evaluate(mask, want_details=True)
+    return [ordered[j].id for j in range(n) if mask & (1 << j)], totals, details
 
 
 # --- settlement: turn balances (paid - owed) into a minimal set of transfers

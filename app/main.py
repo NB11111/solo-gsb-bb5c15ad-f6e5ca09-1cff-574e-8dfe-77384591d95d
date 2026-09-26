@@ -5,6 +5,8 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from .models import (
+    AdmitRequest,
+    AdmitResponse,
     SegmentSplit,
     SettleRequest,
     SettleResponse,
@@ -12,7 +14,7 @@ from .models import (
     SplitResponse,
     Transfer,
 )
-from .splitter import settle_balances, split_fares
+from .splitter import admit_passengers, settle_balances, split_fares
 
 app = FastAPI(
     title="Carpool Fare Splitter",
@@ -79,5 +81,33 @@ def settle(request: SettleRequest) -> SettleResponse:
         transfers=[
             Transfer(**{"from": frm, "to": to, "amount": amount})
             for frm, to, amount in transfers
+        ],
+    )
+
+
+@app.post(
+    "/admit",
+    response_model=AdmitResponse,
+    responses={422: {"description": "Invalid trip or request (bad interval, "
+                                     "out-of-range station, duplicate id, "
+                                     "empty-load charged segment, existing load "
+                                     "already over capacity, more than 12 "
+                                     "candidates, malformed payload, ...)"}},
+)
+def admit(request: AdmitRequest) -> AdmitResponse:
+    admitted_ids, totals, details = admit_passengers(
+        request.segments, request.passengers, request.candidates, request.capacity
+    )
+    return AdmitResponse(
+        admitted=admitted_ids,
+        totals={str(pid): amount for pid, amount in totals.items()},
+        segments=[
+            SegmentSplit(
+                index=d["index"],
+                cost=d["cost"],
+                passengers=d["passengers"],
+                shares={str(pid): amount for pid, amount in d["shares"].items()},
+            )
+            for d in details
         ],
     )
