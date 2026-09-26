@@ -30,6 +30,19 @@ class Passenger(BaseModel):
     alight: NonNegativeInt = Field(description="station index where the passenger alights")
 
 
+class Candidate(Passenger):
+    """A passenger asking to be admitted, plus a personal fare cap.
+
+    Boarding/alighting rules are identical to :class:`Passenger`; ``max_fare``
+    is the most (integer cents) the candidate is willing to owe in total after
+    the fare is re-split over the combined passenger list.
+    """
+
+    max_fare: NonNegativeInt = Field(
+        description="maximum total cents the candidate is willing to pay; must be >= 0"
+    )
+
+
 class SplitRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -69,6 +82,59 @@ class SplitRequest(BaseModel):
         return self
 
 
+class AdmitRequest(SplitRequest):
+    """A split trip plus a seat ``capacity`` and up to 12 candidates.
+
+    The endpoint chooses the best admissible subset of the candidates; see
+    :func:`app.splitter.admit_candidates`.
+    """
+
+    capacity: PositiveInt = Field(
+        description="uniform per-segment seat cap; the existing passengers "
+                    "themselves must not exceed it on any segment"
+    )
+    candidates: List[Candidate] = Field(
+        default_factory=list,
+        max_length=12,
+        description="up to 12 candidate passengers, each with a max_fare cap",
+    )
+
+    @model_validator(mode="after")
+    def _check_admission(self) -> "AdmitRequest":
+        n = len(self.segments)
+
+        existing = {str(p.id) for p in self.passengers}
+        seen = set()
+        for c in self.candidates:
+            key = str(c.id)
+            if key in seen:
+                raise ValueError(f"duplicate candidate id: {c.id!r}")
+            if key in existing:
+                raise ValueError(
+                    f"candidate id {c.id!r} is already an existing passenger"
+                )
+            seen.add(key)
+            if c.board >= c.alight:
+                raise ValueError(
+                    f"candidate {c.id!r}: invalid interval board={c.board}, "
+                    f"alight={c.alight} (board must be < alight)"
+                )
+            if c.alight > n:
+                raise ValueError(
+                    f"candidate {c.id!r}: alight station {c.alight} is out of range; "
+                    f"a trip with {n} segment(s) has stations 0..{n}"
+                )
+
+        for i in range(n):
+            load = sum(p.board <= i < p.alight for p in self.passengers)
+            if load > self.capacity:
+                raise ValueError(
+                    f"segment {i} already carries {load} existing passenger(s), "
+                    f"exceeding the seat capacity of {self.capacity}"
+                )
+        return self
+
+
 class SegmentSplit(BaseModel):
     """How one segment's cost was divided."""
 
@@ -86,6 +152,14 @@ class SplitResponse(BaseModel):
         description="cents charged to each passenger over the whole trip; sums to total_cost"
     )
     segments: List[SegmentSplit] = Field(description="per-segment split detail")
+
+
+class AdmitResponse(SplitResponse):
+    admitted: List[PassengerId] = Field(
+        description="ids of the chosen candidate passengers, ordered in canonical "
+                    "passenger-id order (integers first, numerically; strings then, "
+                    "lexicographically); empty when no candidate could be admitted"
+    )
 
 
 class Payment(BaseModel):

@@ -8,7 +8,7 @@ import random
 import unittest
 from types import SimpleNamespace as P
 
-from app.splitter import _triple, settle_balances, split_fares
+from app.splitter import _triple, admit_candidates, settle_balances, split_fares
 
 
 def ride(pid, board, alight):
@@ -98,6 +98,125 @@ class PropertyTests(unittest.TestCase):
             totals2, details2 = split_fares(segments, shuffled)
             self.assertEqual(totals, totals2)
             self.assertEqual(details, details2)
+
+
+class AdmitCandidatesTests(unittest.TestCase):
+    def test_admit_short_ride_cheaper(self):
+        existing = [ride("a", 0, 2)]
+        candidates = [
+            P(id="x", board=0, alight=2, max_fare=1000),
+            P(id="y", board=0, alight=1, max_fare=1000),
+        ]
+        admitted, totals, _ = admit_candidates([100, 100], existing, candidates, 2)
+        self.assertEqual(admitted, ("y",))
+        self.assertEqual(totals, {"a": 150, "y": 50})
+
+    def test_count_beats_cost(self):
+        existing = [ride("a", 0, 1)]
+        candidates = [
+            P(id="x", board=0, alight=1, max_fare=1000),
+            P(id="y", board=0, alight=1, max_fare=1000),
+        ]
+        admitted, totals, _ = admit_candidates([100], existing, candidates, 3)
+        self.assertEqual(admitted, ("x", "y"))
+        self.assertEqual(totals, {"a": 34, "x": 33, "y": 33})
+
+    def test_capacity_constraint(self):
+        existing = [ride("a", 0, 2), ride("b", 0, 1)]
+        candidates = [
+            P(id="x", board=0, alight=1, max_fare=1000),
+            P(id="y", board=1, alight=2, max_fare=1000),
+        ]
+        admitted, totals, _ = admit_candidates([100, 100], existing, candidates, 2)
+        self.assertEqual(admitted, ("y",))
+        self.assertEqual(totals, {"a": 100, "b": 50, "y": 50})
+
+    def test_max_fare_constraint(self):
+        existing = [ride("a", 0, 1)]
+        candidates = [
+            P(id="x", board=0, alight=1, max_fare=30),
+            P(id="y", board=0, alight=1, max_fare=1000),
+        ]
+        admitted, totals, _ = admit_candidates([100], existing, candidates, 3)
+        self.assertEqual(admitted, ("y",))
+        self.assertEqual(totals, {"a": 50, "y": 50})
+
+    def test_empty_subset_when_nothing_fits(self):
+        existing = [ride("a", 0, 1)]
+        candidates = [P(id="x", board=0, alight=1, max_fare=1000)]
+        admitted, totals, details = admit_candidates([100], existing, candidates, 1)
+        self.assertEqual(admitted, ())
+        self.assertEqual(totals, {"a": 100})
+        self.assertEqual(details[0]["shares"], {"a": 100})
+
+    def test_canonical_id_tiebreak_integers_first(self):
+        existing = [ride("a", 0, 1)]
+        candidates = [
+            P(id=10, board=0, alight=1, max_fare=1000),
+            P(id=9, board=0, alight=1, max_fare=1000),
+        ]
+        admitted, _, _ = admit_candidates([100], existing, candidates, 2)
+        self.assertEqual(admitted, (9,))
+
+    def test_matches_independent_brute_force(self):
+        rng = random.Random(20260926)
+        for _ in range(300):
+            n_seg = rng.randint(1, 5)
+            segments = [rng.randint(0, 99) for _ in range(n_seg)]
+            n_existing = rng.randint(1, 4)
+            # build existing rides with valid intervals; pin the first one to
+            # cover the whole trip so every charged segment has a rider
+            existing = [ride("e0", 0, n_seg)]
+            for i in range(1, n_existing):
+                board = rng.randint(0, n_seg - 1)
+                alight = rng.randint(board + 1, n_seg)
+                existing.append(ride(f"e{i}", board, alight))
+            capacity = rng.randint(
+                max(sum(p.board <= s < p.alight for p in existing)
+                    for s in range(n_seg)),
+                n_existing + 3,
+            )
+            n_cand = rng.randint(0, 6)
+            candidates = []
+            for i in range(n_cand):
+                board = rng.randint(0, n_seg - 1)
+                alight = rng.randint(board + 1, n_seg)
+                candidates.append(P(
+                    id=f"c{i}", board=board, alight=alight,
+                    max_fare=rng.randint(0, 120),
+                ))
+
+            admitted, totals, _ = admit_candidates(
+                segments, existing, candidates, capacity
+            )
+
+            feasible = []
+            for mask in range(1 << n_cand):
+                chosen = [candidates[j] for j in range(n_cand) if mask >> j & 1]
+                loads_ok = all(
+                    sum(p.board <= s < p.alight for p in existing)
+                    + sum(c.board <= s < c.alight for c in chosen)
+                    <= capacity
+                    for s in range(n_seg)
+                )
+                if not loads_ok:
+                    continue
+                t, _ = split_fares(segments, existing + chosen)
+                if all(t[c.id] <= c.max_fare for c in chosen):
+                    key = (
+                        -len(chosen),
+                        sum(t[c.id] for c in chosen),
+                        tuple(sorted((c.id for c in chosen))),
+                    )
+                    feasible.append(key)
+            expected = min(feasible)[2]
+            self.assertEqual(admitted, expected,
+                             (segments, existing, candidates, capacity))
+            # admitted totals really respect the caps and money is conserved
+            self.assertEqual(sum(totals.values()), sum(segments))
+            by_id = {c.id: c for c in candidates}
+            for pid in admitted:
+                self.assertLessEqual(totals[pid], by_id[pid].max_fare)
 
 
 class SettleBalancesTests(unittest.TestCase):

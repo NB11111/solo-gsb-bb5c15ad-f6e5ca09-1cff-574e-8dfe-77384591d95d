@@ -18,6 +18,7 @@ docker compose up --build
 | 地址 | 说明 |
 | --- | --- |
 | http://localhost:8000/split | 分摊接口（POST） |
+| http://localhost:8000/admit | 候选乘客准入 + 重新分摊接口（POST） |
 | http://localhost:8000/settle | 分摊 + 结清转账接口（POST） |
 | http://localhost:8000/docs | Swagger 交互式文档 |
 | http://localhost:8000/healthz | 健康检查 |
@@ -72,6 +73,79 @@ docker compose up --build
 curl -s http://localhost:8000/split \
   -H 'Content-Type: application/json' \
   -d '{"segments":[100,251,80],"passengers":[{"id":"alice","board":0,"alight":3},{"id":"bob","board":1,"alight":3},{"id":"carol","board":0,"alight":1}]}'
+```
+
+## API：`POST /admit`
+
+在 `/split` 的同一套 `segments`、`passengers`（既有乘客）基础上，给出统一座位上限
+`capacity` 与**至多 12 名**候选乘客 `candidates`（站点规则与既有乘客相同，另带
+`max_fare` 愿付上限，整数分、允许 0）。接口从候选中选出一组合法子集并重新分摊：
+
+- **座位约束**：每个路段上「既有乘客 + 入选者」人数不超过 `capacity`；
+- **票价约束**：按 `/split` 的完整规则对**合并后的完整名单**重新分摊后，
+  每位入选者的应付总额不超过其 `max_fare`（既有乘客没有票价上限）。
+
+择优顺序为字典序的三级目标：
+
+1. **入选人数最多**；
+2. 人数并列时，**入选者应付总额最小**；
+3. 仍并列时，取入选 ID 按**规范顺序**（整数 ID 按数值在前、字符串 ID 按字典序在后，
+   各自升序）排序后字典序最小的名单。
+
+候选至多 12 名，因此子集至多 `2^12 = 4096` 个，采用精确枚举保证全局最优；
+座位约束用位掩码快速预检，只有通过的子集才做完整重分摊。
+**没有任何候选可入选时（包括候选列表为空），直接返回原行程的分摊结果**，
+`admitted` 为空列表。
+
+### 请求体
+
+```json
+{
+  "segments": [100, 100],
+  "passengers": [
+    {"id": "alice", "board": 0, "alight": 2}
+  ],
+  "capacity": 2,
+  "candidates": [
+    {"id": "dave", "board": 0, "alight": 2, "max_fare": 100},
+    {"id": "erin", "board": 0, "alight": 1, "max_fare": 60}
+  ]
+}
+```
+
+- `capacity`：每段统一座位上限，正整数；**既有乘客本身在任何路段都不得超员**
+  （否则 422）。
+- `candidates`：候选乘客数组，0–12 个；`id` 彼此唯一且不得与既有乘客重名
+  （整数与字符串按字符串形式判重），`board`/`alight` 规则同既有乘客。
+- `candidates[].max_fare`：该候选愿付的应付总额上限，整数分，`>= 0`。
+
+### 响应（200）
+
+```json
+{
+  "total_cost": 200,
+  "admitted": ["erin"],
+  "totals": {"alice": 150, "erin": 50},
+  "segments": [
+    {"index": 0, "cost": 100, "passengers": ["alice", "erin"], "shares": {"alice": 50, "erin": 50}},
+    {"index": 1, "cost": 100, "passengers": ["alice"],          "shares": {"alice": 100}}
+  ]
+}
+```
+
+- `admitted`：入选候选 ID，按规范顺序排列；无人入选时为 `[]`。
+- `totals`：**合并名单**（既有乘客 + 入选者）逐人应付额，总和恒等于 `total_cost`。
+- `segments[]`：合并名单下的逐路段明细，格式同 `/split`。
+
+上例中两人同乘会在第 0 段超员（3 人 > 容量 2）；dave 独乘全程应付 100、
+erin 只乘第 0 段应付 50，故人数同为 1 时选择应付总额更小的 erin。
+
+### 示例
+
+```bash
+curl -s http://localhost:8000/admit \
+  -H 'Content-Type: application/json' \
+  -d '{"segments":[100,100],"passengers":[{"id":"alice","board":0,"alight":2}],"capacity":2,"candidates":[{"id":"dave","board":0,"alight":2,"max_fare":100},{"id":"erin","board":0,"alight":1,"max_fare":60}]}'
 ```
 
 ## API：`POST /settle`
@@ -150,6 +224,9 @@ curl -s http://localhost:8000/settle \
 - 空载收费路段：某段 `cost > 0` 但无任何乘客在车（费用为 0 的空载段允许）；
 - 非法区间：`board >= alight`、站点越界（`alight > 路段数`）或站点为负；
 - 乘客 ID 重复、费用为负、路段列表为空、字段类型错误或含未知字段；
+- （仅 `/admit`）`capacity` 非正整数，或既有乘客在某路段已超员；
+- （仅 `/admit`）候选超过 12 名、候选 ID 彼此重复或与既有乘客重名、
+  候选站点非法/越界、`max_fare` 为负或非整数；
 - （仅 `/settle`）`payments` 总和不等于行程总额；
 - （仅 `/settle`）`payments` 缺失某位乘客、存在未知 ID 或同一 ID 重复；
 - （仅 `/settle`）付款金额为负或非整数（如小数）。
@@ -168,9 +245,9 @@ uvicorn app.main:app --reload    # 本地起服务，默认 http://127.0.0.1:800
 
 ```
 app/
-  main.py       # FastAPI 应用与路由（POST /split、POST /settle、GET /healthz）
+  main.py       # FastAPI 应用与路由（POST /split、POST /admit、POST /settle、GET /healthz）
   models.py     # 请求/响应模型与 422 校验规则
-  splitter.py   # 核心算法：分摊（精确分数）+ 最少转账结清（子集 DP）
+  splitter.py   # 核心算法：分摊（精确分数）、候选准入（子集枚举）、最少转账结清（子集 DP）
 tests/          # 算法单元测试 + API 集成测试
 Dockerfile      # 依赖与启动命令均固化在镜像内
 compose.yaml    # 单服务编排，含健康检查

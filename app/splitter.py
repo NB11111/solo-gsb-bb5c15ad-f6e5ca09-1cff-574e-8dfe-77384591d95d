@@ -1,14 +1,16 @@
 """Core fare-splitting algorithm.
 
-Pure standard library (exact ``fractions.Fraction`` arithmetic), so it can be
-unit-tested without any web dependencies and stays free of float rounding
-errors. Money amounts are integer cents; theoretical shares are exact
-fractions.
+Pure standard library, so it can be unit-tested without any web dependencies
+and stays free of float rounding errors. Money amounts are integer cents;
+theoretical shares are exact rationals compared through a single common
+denominator (the LCM of the per-segment onboard counts), so every deficit
+comparison is an exact integer comparison — no floats, no per-operation gcd.
 """
 
 from __future__ import annotations
 
-from fractions import Fraction
+from itertools import combinations
+from math import lcm
 from functools import lru_cache
 from typing import Dict, List, Tuple
 
@@ -39,19 +41,33 @@ def split_fares(segment_costs: List[int], passengers) -> Tuple[Dict, List[dict]]
     theoretical share minus what they have actually been allocated so far —
     with ties broken by :func:`tie_key`.
 
+    Exactness is preserved without rationals: every theoretical per-segment
+    share ``cost / n`` is multiplied by the common scale ``D`` (the LCM of all
+    non-zero onboard counts), turning all cumulative shares into integers.
+    Multiplying every deficit by the same positive ``D`` leaves comparisons
+    and tie-breaks exactly as they would be with ``fractions.Fraction``.
+
     Returns ``(totals, details)``: ``totals`` maps passenger id -> allocated
     cents (inserted in canonical id order); ``details`` is a per-segment list
     of dicts with keys ``index``, ``cost``, ``passengers`` and ``shares``.
     """
-    allocated = {p.id: 0 for p in passengers}
-    theoretical = {p.id: Fraction(0) for p in passengers}
-    details: List[dict] = []
-
-    for index, cost in enumerate(segment_costs):
+    onboard_by_segment: List[List] = []
+    scales = 1
+    for index in range(len(segment_costs)):
         onboard = sorted(
             (p.id for p in passengers if p.board <= index < p.alight),
             key=tie_key,
         )
+        onboard_by_segment.append(onboard)
+        if onboard:
+            scales = lcm(scales, len(onboard))
+
+    allocated = {p.id: 0 for p in passengers}
+    theoretical = {p.id: 0 for p in passengers}  # exact share * scales
+    details: List[dict] = []
+
+    for index, cost in enumerate(segment_costs):
+        onboard = onboard_by_segment[index]
         if not onboard:
             # Only reachable for zero-cost segments; charged empty segments
             # are rejected during request validation (HTTP 422).
@@ -59,7 +75,7 @@ def split_fares(segment_costs: List[int], passengers) -> Tuple[Dict, List[dict]]
             continue
 
         base, remainder = divmod(cost, len(onboard))
-        share = Fraction(cost, len(onboard))
+        share = cost * scales // len(onboard)
         for pid in onboard:
             theoretical[pid] += share
 
@@ -68,7 +84,10 @@ def split_fares(segment_costs: List[int], passengers) -> Tuple[Dict, List[dict]]
         # theoretical share. (Adding the current segment's share and base to
         # every onboard passenger shifts all deficits by the same constant,
         # so the ranking is identical to using pre-segment state.)
-        deficits = {pid: theoretical[pid] - (allocated[pid] + base) for pid in onboard}
+        deficits = {
+            pid: theoretical[pid] - (allocated[pid] + base) * scales
+            for pid in onboard
+        }
         ranked = sorted(onboard, key=lambda pid: (-deficits[pid], tie_key(pid)))
         extra = set(ranked[:remainder])
 
@@ -82,6 +101,219 @@ def split_fares(segment_costs: List[int], passengers) -> Tuple[Dict, List[dict]]
 
     totals = {pid: allocated[pid] for pid in sorted(allocated, key=tie_key)}
     return totals, details
+
+
+# --- admission: choose the best subset of fare-capped candidate passengers
+
+
+def admit_candidates(segment_costs, passengers, candidates, capacity):
+    """Choose the best admissible subset of ``candidates``.
+
+    ``passengers`` items must expose ``id``/``board``/``alight``; candidate
+    items additionally expose ``max_fare``. A subset is feasible when:
+
+    1. on every segment the number of existing plus chosen passengers is at
+       most ``capacity``; and
+    2. after re-running :func:`split_fares` over the *combined* list, every
+       chosen candidate owes no more than their ``max_fare``.
+
+    Selection lexicographically (1) maximises the number admitted, (2)
+    minimises the total owed by the admitted passengers, and — to break any
+    remaining tie — (3) prefers the lexicographically smallest tuple of
+    admitted ids in the canonical order of :func:`tie_key`.
+
+    Returns ``(admitted, totals, details)`` where ``admitted`` is the list of
+    chosen candidate ids in canonical order, and ``totals``/``details`` are
+    the :func:`split_fares` output for the combined passenger list. When no
+    candidate can be admitted, the split is simply the original trip's split.
+
+    At most 12 candidates means at most ``2**12`` subsets; candidates are
+    enumerated by decreasing size so the first feasible cardinality ends the
+    search, and capacity checks (cheap bit masks) gate every expensive
+    re-split. Each fare evaluation runs on precomputed integer-indexed arrays
+    (same integer common-denominator arithmetic as :func:`split_fares`), and
+    the full per-segment detail is only built once, for the winning subset.
+    """
+    n_candidates = len(candidates)
+    n_segments = len(segment_costs)
+
+    # Unified ride table: existing riders first, then candidates, held in
+    # canonical id order so that per-segment onboard lists match split_fares.
+    rides = list(passengers) + list(candidates)
+    order = sorted(range(len(rides)), key=lambda k: tie_key(rides[k].id))
+    ride_id = [rides[k].id for k in order]
+    board = [rides[order[k]].board for k in range(len(rides))]
+    alight = [rides[order[k]].alight for k in range(len(rides))]
+    # inverse permutation: canonical position of each original rides index
+    position = {r: k for k, r in enumerate(order)}
+    # canonical ride index of each candidate (by input position)
+    c_ride = [position[len(passengers) + j] for j in range(n_candidates)]
+    max_fare = [c.max_fare for c in candidates]
+    is_existing = [order[k] < len(passengers) for k in range(len(rides))]
+
+    # Per segment, every rider (existing and candidates) as a bit in the
+    # canonical-position space; onboard bits are visited in ascending bit
+    # order, which is exactly the canonical id order.
+    seg_riders = [0] * n_segments
+    exist_mask = 0
+    for k in range(len(rides)):  # k is a canonical ride position
+        for i in range(board[k], alight[k]):
+            seg_riders[i] |= 1 << k
+        if is_existing[k]:
+            exist_mask |= 1 << k
+    segment_load = [(seg_riders[i] & exist_mask).bit_count() for i in range(n_segments)]
+
+    # Candidate presence expressed in the canonical-position bit space.
+    cbit = [1 << c_ride[j] for j in range(n_candidates)]
+
+    candidate_masks = [0] * n_segments  # input-position bits, for capacity checks
+    for j, c in enumerate(candidates):
+        for i in range(c.board, c.alight):
+            candidate_masks[i] |= 1 << j
+
+    scales = 1
+    for i in range(n_segments):
+        n_full = seg_riders[i].bit_count()
+        n_exist = segment_load[i]
+        for add in range(n_exist, n_full + 1):
+            scales = lcm(scales, add)
+
+    tight_segments = [i for i in range(n_segments) if candidate_masks[i]]
+    seg_cost = list(segment_costs)
+
+    # Cache the canonical (ascending-bit) onboard list per distinct onboard
+    # mask actually encountered, so bit extraction happens at most once each.
+    onboard_cache: Dict[int, tuple] = {}
+
+    def onboard_bits(mask: int) -> tuple:
+        bits = onboard_cache.get(mask)
+        if bits is None:
+            out = []
+            m = mask
+            while m:
+                b = m & -m
+                out.append(b.bit_length() - 1)
+                m ^= b
+            bits = tuple(out)
+            onboard_cache[mask] = bits
+        return bits
+
+    def _allocate_pass(onboard, cost, allocated, theoretical, scales, record=None):
+        """Allocate one segment's cost over an already canonical-order list.
+
+        Extra cents must go to the ``remainder`` riders with the largest
+        deficits, ties broken by canonical id order. Since ``onboard`` is
+        already in canonical id order, scanning it once and keeping, at each
+        step, the best ``remainder`` positions seen so far yields exactly that
+        set without sorting.
+        """
+        n_on = len(onboard)
+        base, remainder = divmod(cost, n_on)
+        share = cost * scales // n_on
+        for k in onboard:
+            theoretical[k] += share
+        # `winners` holds the best `remainder` (-deficit asc, k asc) pairs
+        # seen, kept sorted best-first. Scanning in ascending k means equal
+        # deficits are met in k order, so insertion shifts any worse holders.
+        winners: list = []
+        if remainder:
+            for k in onboard:
+                deficit = theoretical[k] - (allocated[k] + base) * scales
+                rank = (-deficit, k)
+                if len(winners) < remainder:
+                    pos = len(winners)
+                    while pos > 0 and winners[pos - 1] > rank:
+                        pos -= 1
+                    winners.insert(pos, rank)
+                elif rank < winners[-1]:
+                    pos = remainder - 1
+                    while pos > 0 and winners[pos - 1] > rank:
+                        pos -= 1
+                    winners.insert(pos, rank)
+                    winners.pop()
+        extra = 0
+        for _, k in winners:
+            extra |= 1 << k
+        for k in onboard:
+            allocated[k] += base + (1 if (extra >> k) & 1 else 0)
+        if record is not None:
+            shares = {}
+            for k in onboard:
+                shares[record[0][k]] = base + (1 if (extra >> k) & 1 else 0)
+            record[1].append({
+                "index": record[2], "cost": cost,
+                "passengers": [record[0][k] for k in onboard], "shares": shares,
+            })
+
+    def evaluate(mask: int):
+        """Allocated cents per canonical ride index for one chosen subset."""
+        present = exist_mask
+        for j in range(n_candidates):
+            if mask >> j & 1:
+                present |= cbit[j]
+        allocated = [0] * len(rides)
+        theoretical = [0] * len(rides)
+        for i, cost in enumerate(seg_cost):
+            onboard_m = seg_riders[i] & present
+            if onboard_m:
+                _allocate_pass(
+                    onboard_bits(onboard_m), cost, allocated, theoretical, scales
+                )
+        return allocated
+
+    def fits_capacity(mask: int) -> bool:
+        for i in tight_segments:
+            if segment_load[i] + (mask & candidate_masks[i]).bit_count() > capacity:
+                return False
+        return True
+
+    best = None  # (admitted_ids_tuple, mask, admitted_sum)
+    for size in range(n_candidates, -1, -1):
+        for combo in combinations(range(n_candidates), size):
+            mask = 0
+            for j in combo:
+                mask |= 1 << j
+            if not fits_capacity(mask):
+                continue
+            allocated = evaluate(mask)
+            if all(allocated[c_ride[j]] <= max_fare[j] for j in combo):
+                admitted = tuple(ride_id[c_ride[j]] for j in sorted(
+                    combo, key=lambda j: tie_key(candidates[j].id)))
+                admitted_sum = sum(allocated[c_ride[j]] for j in combo)
+                if best is None or admitted_sum < best[2] or (
+                    admitted_sum == best[2]
+                    and [tie_key(pid) for pid in admitted]
+                    < [tie_key(pid) for pid in best[0]]
+                ):
+                    best = (admitted, mask, admitted_sum)
+        if best is None:
+            continue
+
+        # Build split_fares-shaped output once for the winning subset.
+        admitted, mask, _ = best
+        present = exist_mask
+        for j in range(n_candidates):
+            if mask >> j & 1:
+                present |= cbit[j]
+        totals = {}
+        details: List[dict] = []
+        allocated = [0] * len(rides)
+        theoretical = [0] * len(rides)
+        for i, cost in enumerate(seg_cost):
+            onboard_m = seg_riders[i] & present
+            if not onboard_m:
+                details.append({"index": i, "cost": cost, "passengers": [], "shares": {}})
+                continue
+            _allocate_pass(
+                onboard_bits(onboard_m), cost, allocated, theoretical, scales,
+                record=(ride_id, details, i),
+            )
+        for k in range(len(rides)):
+            if (present >> k) & 1:
+                totals[ride_id[k]] = allocated[k]
+        totals = {pid: totals[pid] for pid in sorted(totals, key=tie_key)}
+        return admitted, totals, details
+    return None  # unreachable: the empty subset is always feasible
 
 
 # --- settlement: turn balances (paid - owed) into a minimal set of transfers

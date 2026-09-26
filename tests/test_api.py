@@ -100,6 +100,269 @@ class SplitApiTests(unittest.TestCase):
         self.assertEqual(client.post("/split", json=payload).status_code, 422)
 
 
+class AdmitApiTests(unittest.TestCase):
+    def test_admit_prefers_short_ride_and_resplits(self):
+        # x would ride both segments, y only segment 0; capacity 2 with one
+        # existing passenger means only one fits on segment 0, and y's total
+        # (50) is cheaper than x's would be (100), so y is chosen.
+        payload = {
+            "segments": [100, 100],
+            "passengers": [{"id": "a", "board": 0, "alight": 2}],
+            "capacity": 2,
+            "candidates": [
+                {"id": "x", "board": 0, "alight": 2, "max_fare": 1000},
+                {"id": "y", "board": 0, "alight": 1, "max_fare": 1000},
+            ],
+        }
+        resp = client.post("/admit", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["admitted"], ["y"])
+        self.assertEqual(body["total_cost"], 200)
+        self.assertEqual(body["totals"], {"a": 150, "y": 50})
+        self.assertEqual(sum(body["totals"].values()), 200)
+        self.assertEqual(body["segments"][0]["passengers"], ["a", "y"])
+        self.assertEqual(body["segments"][0]["shares"], {"a": 50, "y": 50})
+        self.assertEqual(body["segments"][1]["passengers"], ["a"])
+        self.assertEqual(body["segments"][1]["shares"], {"a": 100})
+
+    def test_admit_maximises_count_before_cost(self):
+        # cap 3: both candidates fit and each owes 33 <= 1000 -> both admitted,
+        # even though admitting just one would cost that one only 50.
+        payload = {
+            "segments": [100],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+            "capacity": 3,
+            "candidates": [
+                {"id": "x", "board": 0, "alight": 1, "max_fare": 1000},
+                {"id": "y", "board": 0, "alight": 1, "max_fare": 1000},
+            ],
+        }
+        body = client.post("/admit", json=payload).json()
+        self.assertEqual(body["admitted"], ["x", "y"])
+        self.assertEqual(body["totals"], {"a": 34, "x": 33, "y": 33})
+
+    def test_capacity_blocks_full_segments(self):
+        # segment 0 already carries a and b at capacity; x needs it and is
+        # rejected, while y boards at segment 1 where only a is on board.
+        payload = {
+            "segments": [100, 100],
+            "passengers": [{"id": "a", "board": 0, "alight": 2},
+                           {"id": "b", "board": 0, "alight": 1}],
+            "capacity": 2,
+            "candidates": [
+                {"id": "x", "board": 0, "alight": 1, "max_fare": 1000},
+                {"id": "y", "board": 1, "alight": 2, "max_fare": 1000},
+            ],
+        }
+        body = client.post("/admit", json=payload).json()
+        self.assertEqual(body["admitted"], ["y"])
+        self.assertEqual(body["totals"], {"a": 100, "b": 50, "y": 50})
+
+    def test_max_fare_can_exclude_a_candidate(self):
+        # together x,y would each owe 33 > x's cap of 30; alone x would owe
+        # 50 > 30; y alone owes exactly 50 -> only y is admitted.
+        payload = {
+            "segments": [100],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+            "capacity": 3,
+            "candidates": [
+                {"id": "x", "board": 0, "alight": 1, "max_fare": 30},
+                {"id": "y", "board": 0, "alight": 1, "max_fare": 1000},
+            ],
+        }
+        body = client.post("/admit", json=payload).json()
+        self.assertEqual(body["admitted"], ["y"])
+        self.assertEqual(body["totals"], {"a": 50, "y": 50})
+
+    def test_max_fare_is_respected_even_when_all_fit(self):
+        # two seats free but x caps at 0 and the segment costs 100:
+        # no subset containing x is feasible.
+        payload = {
+            "segments": [100],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+            "capacity": 3,
+            "candidates": [
+                {"id": "x", "board": 0, "alight": 1, "max_fare": 0},
+            ],
+        }
+        body = client.post("/admit", json=payload).json()
+        self.assertEqual(body["admitted"], [])
+        self.assertEqual(body["totals"], {"a": 100})
+
+    def test_tie_broken_by_canonical_id_order(self):
+        # x and y are symmetric alternatives for the single free seat.
+        payload = {
+            "segments": [0, 100],
+            "passengers": [{"id": "a", "board": 0, "alight": 2}],
+            "capacity": 2,
+            "candidates": [
+                {"id": "x", "board": 1, "alight": 2, "max_fare": 1000},
+                {"id": "y", "board": 1, "alight": 2, "max_fare": 1000},
+            ],
+        }
+        body = client.post("/admit", json=payload).json()
+        self.assertEqual(body["admitted"], ["x"])
+
+    def test_integer_ids_sort_numerically(self):
+        # 9 and 10 are symmetric; numeric order picks 9 (not "10").
+        payload = {
+            "segments": [100],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+            "capacity": 2,
+            "candidates": [
+                {"id": 10, "board": 0, "alight": 1, "max_fare": 1000},
+                {"id": 9, "board": 0, "alight": 1, "max_fare": 1000},
+            ],
+        }
+        body = client.post("/admit", json=payload).json()
+        self.assertEqual(body["admitted"], [9])
+        self.assertEqual(body["totals"], {"9": 50, "a": 50})
+
+    def test_no_feasible_new_passenger_returns_original_split(self):
+        payload = {
+            "segments": [100],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+            "capacity": 1,
+            "candidates": [
+                {"id": "x", "board": 0, "alight": 1, "max_fare": 1000},
+            ],
+        }
+        body = client.post("/admit", json=payload).json()
+        self.assertEqual(body["admitted"], [])
+        self.assertEqual(body["totals"], {"a": 100})
+        self.assertEqual(body["segments"][0]["shares"], {"a": 100})
+
+    def test_empty_candidates_returns_original_split(self):
+        payload = {
+            "segments": [100, 0, 50],
+            "passengers": [{"id": "a", "board": 0, "alight": 1},
+                           {"id": "b", "board": 2, "alight": 3}],
+            "capacity": 2,
+            "candidates": [],
+        }
+        body = client.post("/admit", json=payload).json()
+        self.assertEqual(body["admitted"], [])
+        self.assertEqual(body["totals"], {"a": 100, "b": 50})
+        self.assertEqual(body["total_cost"], 150)
+
+    def test_input_order_does_not_matter(self):
+        payload = {
+            "segments": [100, 100],
+            "passengers": [{"id": "a", "board": 0, "alight": 2}],
+            "capacity": 3,
+            "candidates": [
+                {"id": "x", "board": 0, "alight": 2, "max_fare": 67},
+                {"id": "y", "board": 0, "alight": 1, "max_fare": 1000},
+            ],
+        }
+        baseline = client.post("/admit", json=payload).json()
+        shuffled = dict(payload, candidates=list(reversed(payload["candidates"])))
+        resp = client.post("/admit", json=shuffled)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json(), baseline)
+
+    def test_existing_load_over_capacity_is_422(self):
+        payload = {
+            "segments": [10],
+            "passengers": [{"id": "a", "board": 0, "alight": 1},
+                           {"id": "b", "board": 0, "alight": 1}],
+            "capacity": 1,
+            "candidates": [],
+        }
+        resp = client.post("/admit", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("exceeding the seat capacity", resp.text)
+
+    def test_duplicate_candidate_id_is_422(self):
+        payload = {
+            "segments": [10],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+            "capacity": 2,
+            "candidates": [
+                {"id": "x", "board": 0, "alight": 1, "max_fare": 5},
+                {"id": "x", "board": 0, "alight": 1, "max_fare": 5},
+            ],
+        }
+        resp = client.post("/admit", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("duplicate candidate id", resp.text)
+
+    def test_candidate_id_conflicting_with_existing_is_422(self):
+        payload = {
+            "segments": [10],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+            "capacity": 2,
+            "candidates": [{"id": "a", "board": 0, "alight": 1, "max_fare": 5}],
+        }
+        resp = client.post("/admit", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("already an existing passenger", resp.text)
+
+    def test_candidate_bad_interval_is_422(self):
+        payload = {
+            "segments": [10],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+            "capacity": 2,
+            "candidates": [{"id": "x", "board": 1, "alight": 1, "max_fare": 5}],
+        }
+        resp = client.post("/admit", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("invalid interval", resp.text)
+
+    def test_candidate_station_out_of_range_is_422(self):
+        payload = {
+            "segments": [10],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+            "capacity": 2,
+            "candidates": [{"id": "x", "board": 0, "alight": 2, "max_fare": 5}],
+        }
+        resp = client.post("/admit", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("out of range", resp.text)
+
+    def test_more_than_12_candidates_is_422(self):
+        payload = {
+            "segments": [10],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+            "capacity": 50,
+            "candidates": [
+                {"id": f"c{i}", "board": 0, "alight": 1, "max_fare": 1000}
+                for i in range(13)
+            ],
+        }
+        self.assertEqual(client.post("/admit", json=payload).status_code, 422)
+
+    def test_non_positive_capacity_is_422(self):
+        payload = {
+            "segments": [10],
+            "passengers": [],
+            "capacity": 0,
+            "candidates": [],
+        }
+        self.assertEqual(client.post("/admit", json=payload).status_code, 422)
+
+    def test_split_trip_rules_still_apply_on_admit(self):
+        # empty-load charged segment remains invalid even with no passengers
+        payload = {
+            "segments": [10],
+            "passengers": [],
+            "capacity": 1,
+            "candidates": [],
+        }
+        self.assertEqual(client.post("/admit", json=payload).status_code, 422)
+
+    def test_unknown_field_is_422(self):
+        payload = {
+            "segments": [10],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+            "capacity": 2,
+            "candidates": [],
+            "currency": "usd",
+        }
+        self.assertEqual(client.post("/admit", json=payload).status_code, 422)
+
+
 class SettleApiTests(unittest.TestCase):
     def test_settle_ok(self):
         resp = client.post("/settle", json=SETTLE_PAYLOAD)

@@ -5,6 +5,8 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from .models import (
+    AdmitRequest,
+    AdmitResponse,
     SegmentSplit,
     SettleRequest,
     SettleResponse,
@@ -12,7 +14,7 @@ from .models import (
     SplitResponse,
     Transfer,
 )
-from .splitter import settle_balances, split_fares
+from .splitter import admit_candidates, settle_balances, split_fares
 
 app = FastAPI(
     title="Carpool Fare Splitter",
@@ -42,6 +44,36 @@ def split(request: SplitRequest) -> SplitResponse:
     totals, details = split_fares(request.segments, request.passengers)
     return SplitResponse(
         total_cost=sum(request.segments),
+        totals={str(pid): amount for pid, amount in totals.items()},
+        segments=[
+            SegmentSplit(
+                index=d["index"],
+                cost=d["cost"],
+                passengers=d["passengers"],
+                shares={str(pid): amount for pid, amount in d["shares"].items()},
+            )
+            for d in details
+        ],
+    )
+
+
+@app.post(
+    "/admit",
+    response_model=AdmitResponse,
+    responses={422: {"description": "Invalid trip or admission request "
+                                     "(bad interval, out-of-range station, "
+                                     "duplicate/conflicting id, empty-load "
+                                     "charged segment, existing load over "
+                                     "capacity, more than 12 candidates, "
+                                     "malformed payload, ...)"}},
+)
+def admit(request: AdmitRequest) -> AdmitResponse:
+    admitted, totals, details = admit_candidates(
+        request.segments, request.passengers, request.candidates, request.capacity
+    )
+    return AdmitResponse(
+        total_cost=sum(request.segments),
+        admitted=list(admitted),
         totals={str(pid): amount for pid, amount in totals.items()},
         segments=[
             SegmentSplit(
